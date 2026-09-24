@@ -24,9 +24,12 @@ Used for two purposes: identifying the target window and tracking its position i
 |---|---|---|
 | `AXUIElementCreateApplication` | 10.2 | Get app reference by PID |
 | `AXUIElementCopyAttributeValue` | 10.2 | Read focused/main window |
-| `AXObserverCreate` / `AddNotification` | 10.4 | Watch for window move/resize |
+| `AXObserverCreate` / `AddNotification` | 10.4 | Watch for window move/resize/focus |
 | `kAXWindowMovedNotification` | 10.4 | Event-driven position sync |
 | `kAXWindowResizedNotification` | 10.4 | Event-driven size sync |
+| `kAXApplicationActivatedNotification` | 10.4 | Re-check focus when the real window's app activates |
+| `kAXApplicationDeactivatedNotification` | 10.4 | Re-check focus when the real window's app deactivates |
+| `kAXFocusedWindowChangedNotification` | 10.4 | Show/hide mirror when focus moves between sibling windows of the same app |
 | `AXIsProcessTrustedWithOptions` | 10.9 | Request permission |
 
 **Fragility: Very low.** Foundation of macOS accessibility. Screen readers, enterprise tools, and automation depend on it. Apple has never broken backward compatibility.
@@ -104,4 +107,8 @@ Apple's direction is toward more frequent permission re-authorization. The app s
 
 3. **Full-screen apps** — full-screen windows use a separate space. The mirror cannot float above a full-screen app.
 
-4. **Performance** — each pinned window runs a 60fps SCStream capture, but `didOutputSampleBuffer` drops any frame whose `SCStreamFrameInfo.status` is not `.complete`. A static window sends almost no complete frames, so CPU use stays near zero until its content actually changes. Pinning many windows that are all actively changing at once will still increase GPU/CPU usage.
+4. **Performance** — each pinned window runs a 60fps SCStream capture, but `didOutputSampleBuffer` drops any frame whose `SCStreamFrameInfo.status` is not `.complete`. A static window sends almost no complete frames, so CPU use stays near zero until its content actually changes. The stream also slows to near-idle while the mirror is hidden behind the focused real window. Pinning many windows that are all actively changing at once will still increase GPU/CPU usage.
+
+5. **First click still lands on whatever is under the mirror** — the panel ignores mouse events, so a click on it passes through to the real window only if the real window is directly underneath. If a different window covers the real window at that point on screen, that other window receives the click first.
+
+6. **No automated tests** — this repo has no test target. Verify the focus-hide behavior manually: rapid focus flapping between sibling windows of the same app, and a focus change during the ~150ms resize debounce window.

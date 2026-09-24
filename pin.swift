@@ -8,6 +8,9 @@ import AVFoundation
 class CaptureManager: NSObject, SCStreamDelegate, SCStreamOutput {
     let videoLayer = AVSampleBufferDisplayLayer()
     private var stream: SCStream?
+    private var width = 0
+    private var height = 0
+    private var paused = false
     var capturing = false
     var onError: (() -> Void)?
 
@@ -22,12 +25,14 @@ class CaptureManager: NSObject, SCStreamDelegate, SCStreamOutput {
 
         let filter = SCContentFilter(desktopIndependentWindow: window)
         if #available(macOS 14, *) {
-            config.width = Int(filter.contentRect.width * CGFloat(filter.pointPixelScale))
-            config.height = Int(filter.contentRect.height * CGFloat(filter.pointPixelScale))
+            width = Int(filter.contentRect.width * CGFloat(filter.pointPixelScale))
+            height = Int(filter.contentRect.height * CGFloat(filter.pointPixelScale))
         } else {
-            config.width = Int(window.frame.width * 2)
-            config.height = Int(window.frame.height * 2)
+            width = Int(window.frame.width * 2)
+            height = Int(window.frame.height * 2)
         }
+        config.width = width
+        config.height = height
 
         stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream?.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global())
@@ -43,13 +48,30 @@ class CaptureManager: NSObject, SCStreamDelegate, SCStreamOutput {
     }
 
     func updateCaptureSize(width: Int, height: Int) {
+        self.width = width
+        self.height = height
+        applyConfiguration()
+    }
+
+    /// Slows the stream to near-idle while the mirror is hidden behind the
+    /// focused real window, instead of leaving it at 60fps with nothing on
+    /// screen to show the output. Keeping the stream alive rather than
+    /// stopping it avoids the restart latency of a fresh `startCapture`
+    /// when the mirror reappears.
+    func setPaused(_ paused: Bool) {
+        guard self.paused != paused else { return }
+        self.paused = paused
+        applyConfiguration()
+    }
+
+    private func applyConfiguration() {
         guard let s = stream else { return }
         let config = SCStreamConfiguration()
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = false
         config.capturesAudio = false
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        config.minimumFrameInterval = paused ? CMTime(value: 1, timescale: 2) : CMTime(value: 1, timescale: 60)
         config.width = width
         config.height = height
         s.updateConfiguration(config) { err in
@@ -109,10 +131,21 @@ class MirrorPanel {
     let scWindow: SCWindow
     let capture = CaptureManager()
     var panel: NSPanel!
+    private var axApp: AXUIElement?
     private var axObserver: AXObserver?
     private var aliveTimer: Timer?
     private var clickMonitor: Any?
     private var resizeDebounce: DispatchWorkItem?
+    private var realWindowFocused = false
+    private var stopped = false
+
+    /// Polls at `hiddenFocusPollInterval` while the mirror is hidden, and
+    /// `visiblePollInterval` otherwise. This is a backstop for a missed AX
+    /// notification, so it only needs to run fast while the mirror is
+    /// hidden — that is the state where a missed notification leaves the
+    /// real window uncovered with nothing showing on top of it.
+    private static let hiddenFocusPollInterval: TimeInterval = 0.25
+    private static let visiblePollInterval: TimeInterval = 1.0
 
     init(scWindow: SCWindow) {
         self.scWindow = scWindow
@@ -131,6 +164,9 @@ class MirrorPanel {
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.ignoresMouseEvents = true
+        // Default fade animation overlaps a hide with the next show when they
+        // happen within a fraction of a second, leaving a double image.
+        panel.animationBehavior = .none
 
         let view = NSView(frame: NSRect(origin: .zero, size: nsFrame.size))
         view.wantsLayer = true
@@ -161,14 +197,14 @@ class MirrorPanel {
             stop()
             return
         }
+        guard !stopped else { return }
         startAXObserver()
         startClickMonitor()
-        aliveTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.checkAlive()
-        }
+        updateFocusState()
     }
 
     func stop() {
+        stopped = true
         aliveTimer?.invalidate()
         aliveTimer = nil
         resizeDebounce?.cancel()
@@ -183,6 +219,7 @@ class MirrorPanel {
                                   .defaultMode)
         }
         axObserver = nil
+        axApp = nil
         capture.stopCapture()
         panel.close()
     }
@@ -191,26 +228,56 @@ class MirrorPanel {
         guard let pid = scWindow.owningApplication?.processID else { return }
 
         let axApp = AXUIElementCreateApplication(pid_t(pid))
-        guard let axWin = findAXWindow(axApp: axApp) else {
-            print("[warn] cannot find AX window for observer")
-            return
+        AXUIElementSetMessagingTimeout(axApp, 0.1)
+        self.axApp = axApp
+        // Even if the window itself can't be found (e.g. its AX window list
+        // hasn't caught up yet), the app-level notifications below still
+        // register — they key off axApp, not axWin.
+        let axWin = findAXWindow(axApp: axApp)
+        if axWin == nil {
+            print("[warn] cannot find AX window for observer; move/resize sync and focus hiding fall back to the poll")
         }
 
         typealias Callback = @convention(c) (AXObserver, AXUIElement, CFString, UnsafeMutableRawPointer?) -> Void
-        let cb: Callback = { _, _, _, ptr in
+        let cb: Callback = { _, _, name, ptr in
             guard let ptr else { return }
             let mirror = Unmanaged<MirrorPanel>.fromOpaque(ptr).takeUnretainedValue()
-            DispatchQueue.main.async { mirror.syncFrame() }
+            DispatchQueue.main.async { mirror.handleAXNotification(name as String) }
         }
 
         var obs: AXObserver?
         guard AXObserverCreate(pid_t(pid), cb, &obs) == .success, let observer = obs else { return }
 
         let ptr = Unmanaged.passUnretained(self).toOpaque()
-        AXObserverAddNotification(observer, axWin, kAXWindowMovedNotification as CFString, ptr)
-        AXObserverAddNotification(observer, axWin, kAXWindowResizedNotification as CFString, ptr)
+        if let axWin {
+            addAXNotification(observer, axWin, kAXWindowMovedNotification, ptr)
+            addAXNotification(observer, axWin, kAXWindowResizedNotification, ptr)
+        }
+        addAXNotification(observer, axApp, kAXApplicationActivatedNotification, ptr)
+        addAXNotification(observer, axApp, kAXApplicationDeactivatedNotification, ptr)
+        addAXNotification(observer, axApp, kAXFocusedWindowChangedNotification, ptr)
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
         axObserver = observer
+    }
+
+    private func addAXNotification(_ observer: AXObserver, _ element: AXUIElement, _ name: String, _ ptr: UnsafeMutableRawPointer) {
+        let result = AXObserverAddNotification(observer, element, name as CFString, ptr)
+        if result != .success {
+            print("[warn] AXObserverAddNotification(\(name)) failed: \(result)")
+        }
+    }
+
+    private func handleAXNotification(_ name: String) {
+        guard !stopped else { return }
+        switch name {
+        case kAXWindowMovedNotification, kAXWindowResizedNotification:
+            syncFrame()
+        default:
+            // Routes through checkAlive() rather than calling updateFocusState()
+            // directly, so a focus event that arrives after the pinned window
+            // has closed unpins it instead of re-showing a mirror of nothing.
+            checkAlive()
+        }
     }
 
     private func findAXWindow(axApp: AXUIElement) -> AXUIElement? {
@@ -257,11 +324,64 @@ class MirrorPanel {
         }
     }
 
+    private func scheduleAliveCheck() {
+        aliveTimer?.invalidate()
+        let interval = realWindowFocused ? Self.hiddenFocusPollInterval : Self.visiblePollInterval
+        aliveTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            self?.checkAlive()
+        }
+    }
+
     private func checkAlive() {
         let exists = CGWindowListCopyWindowInfo([.optionIncludingWindow], scWindow.windowID) as? [[String: Any]]
         if exists?.isEmpty ?? true {
             PinManager.shared.unpinByWindowID(scWindow.windowID)
+            return
         }
+        updateFocusState()
+    }
+
+    /// True when the real window, not just its app, holds focus. Checking
+    /// the app alone would keep the mirror hidden for an unfocused sibling
+    /// window of the same app.
+    private func isRealWindowFocused() -> Bool {
+        guard let pid = scWindow.owningApplication?.processID,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == pid_t(pid),
+              let axApp else { return false }
+
+        var ref: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &ref)
+        guard status == .success, let focusedWin = ref else {
+            // A busy or beach-balling app returns .cannotComplete transiently;
+            // treat that as "unchanged" instead of "not focused" so a hiccup
+            // doesn't flash the mirror over the window the user is using.
+            return status == .cannotComplete ? realWindowFocused : false
+        }
+
+        var wid: CGWindowID = 0
+        return _AXUIElementGetWindow(focusedWin as! AXUIElement, &wid) == .success && wid == scWindow.windowID
+    }
+
+    private func updateFocusState() {
+        let focused = isRealWindowFocused()
+        if focused != realWindowFocused {
+            realWindowFocused = focused
+            if focused {
+                capture.setPaused(true)
+                panel.orderOut(nil)
+                print("[info] mirror hidden, real window focused (window \(scWindow.windowID))")
+            } else {
+                capture.setPaused(false)
+                syncFrame()
+                panel.orderFrontRegardless()
+                print("[info] mirror shown, real window lost focus (window \(scWindow.windowID))")
+            }
+        }
+        // Rearm at the interval for the state we just settled on, so a
+        // flip (from here or from an AX notification) takes effect on the
+        // next tick instead of waiting out whatever interval was already
+        // in flight.
+        scheduleAliveCheck()
     }
 
     private func startClickMonitor() {
@@ -800,7 +920,8 @@ func printUsage() {
     How it works:
       Uses ScreenCaptureKit to mirror the target window into a floating
       overlay panel. The overlay passes all mouse events through to the
-      real window underneath.
+      real window underneath. The overlay hides itself while the real
+      window has focus, and shows again when focus moves elsewhere.
 
     Permissions required:
       - Screen Recording  (System Settings > Privacy & Security > Screen Recording)

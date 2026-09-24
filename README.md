@@ -30,7 +30,7 @@ There's no public macOS API to change another app's window level. PinWindow work
 └─────────────────────────────────────┘
 ```
 
-When you click on the pinned window, a global click monitor detects the click and activates the real app, bringing its window to the front for interaction.
+When you click on the pinned window, a global click monitor detects the click and activates the real app, bringing its window to the front for interaction. The mirror then hides itself, since the real window now has focus, and shows again once focus moves elsewhere.
 
 ## Features
 
@@ -38,6 +38,7 @@ When you click on the pinned window, a global click monitor detects the click an
 - **Per-window pin/unpin** — pin multiple windows from the same app independently
 - **Global hotkeys** — Option+P to pin frontmost, Option+U to unpin last
 - **Click-to-activate** — clicking a pinned window brings the real app to focus
+- **Hides while focused** — the mirror hides itself while the real window has focus, so there is no lag while you interact with it, and shows again once focus moves elsewhere
 - **Auto-unpin** — mirrors are automatically removed when the source app quits
 - **Window title display** — pinned Chrome tabs show their page title so you can tell them apart
 - **HUD notifications** — brief overlay confirms pin/unpin actions
@@ -141,7 +142,7 @@ The entire app is a single Swift file (`pin.swift`, ~800 lines):
 | Component | Role |
 |---|---|
 | `CaptureManager` | Wraps `SCStream` for 60fps window capture, filtering to complete frames only |
-| `MirrorPanel` | `NSPanel` overlay that displays the capture, syncs position via `AXObserver`, detects clicks to activate the real window |
+| `MirrorPanel` | `NSPanel` overlay that displays the capture, syncs position via `AXObserver`, detects clicks to activate the real window, hides while the real window has focus |
 | `PinManager` | Singleton managing all mirrors — pin/unpin by name, PID, or window ID |
 | `AppDelegate` | Menu bar UI with dynamic `NSMenuDelegate`, CLI argument handling, permission requests |
 | Hotkey handler | Carbon `RegisterEventHotKey` for global Option+P/U |
